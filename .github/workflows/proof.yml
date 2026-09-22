@@ -1,0 +1,7 @@
+name: proof
+on: [pull_request]
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo proof
