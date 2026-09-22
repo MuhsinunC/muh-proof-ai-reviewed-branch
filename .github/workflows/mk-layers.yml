@@ -1,0 +1,23 @@
+name: mk-layers
+on: [workflow_dispatch]
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  layers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: alpha, fetch-depth: 0 }
+      - run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git switch -c feat/proof-bottom
+          echo bottom > bottom.txt && git add bottom.txt && git commit -m 'Add bottom layer'
+          git push origin feat/proof-bottom
+          gh pr create --base main --head feat/proof-bottom --title 'PROOF-1: bottom layer' --body 'Throwaway proof layer opened by the Actions bot so the owner can approve it.'
+          git switch -c feat/proof-top
+          echo top > top.txt && git add top.txt && git commit -m 'Add top layer'
+          git push origin feat/proof-top
+          gh pr create --base feat/proof-bottom --head feat/proof-top --title 'PROOF-2: top layer' --body 'Throwaway proof layer; lands after the bottom.'
+        env: { GH_TOKEN: "${{ github.token }}" }

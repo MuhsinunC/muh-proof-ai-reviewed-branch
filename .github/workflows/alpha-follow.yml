@@ -1,0 +1,355 @@
+name: alpha-follow
+# alpha-follow template version: c670170 (rendered for HUMAN_BRANCH=main AI_BRANCH=alpha from the ai-reviewed-branch skill; edit the template, not this file)
+# The AI branch is the top of the stacked-PR set with a configurable human branch. Nobody pushes the AI branch by hand;
+# this workflow moves it to the top open layer whenever the stack changes, and to the human branch when
+# no layers are open or when more than one independent stack is open (several chains may be
+# rooted at the human branch; a fork inside a chain is still an error).
+# Set HUMAN_BRANCH below to the repository's chosen human branch. This file is generated from the ai-reviewed-branch
+# skill's assets/alpha-follow.yml (the single source of truth): edit it there and re-render with
+# scripts/workflow-drift.sh --render; scripts/workflow-drift.sh OWNER/REPO reports drift.
+#
+# Two kinds of run:
+# - Landing runs (a push to the human branch, or a PR merged into the human branch) retarget the children of landed
+#   layers to the human branch, delete the landed branches, then rebase every chain bottom-up and push the
+#   rebased layers with leases. The push-to-human-branch run repeats the cascade because GitHub may
+#   replace a pending merged-PR run with a newer run in the same group; the cascade is idempotent
+#   (current layers are skipped, absent branches are not deleted twice).
+# - Resolver runs (a push to a layer, PR open/reopen/edit, a close without merge) only move the AI branch.
+#   They never rebase or force-push anyone's branch: an amended parent is the contributor's to
+#   restack, and the next landing rebases the whole chain anyway.
+# Layer prefixes live in ONE place: the LAYER_PREFIXES env below. push.branches cannot read env, so it
+# is deliberately broad ('**' minus the AI branch) and the Python filter applies the real rule.
+# The AI branch lease: the resolver reads the AI branch, then the PR graph, and pushes --force-with-lease on that AI branch
+# after re-fetching the AI branch and the target together. A lost lease means a concurrent run moved the AI branch from
+# another graph: the run re-resolves ONCE (fresh graph, fresh lease) and then fails; the next event
+# resolves again. Resolver runs wait (LANDING_WAIT_SECONDS) while a landing run is queued or running,
+# because the landing resolves the AI branch from the graph after its cascade and would otherwise race them.
+# Remaining window, stated honestly: a run whose re-resolve loses a second race, or a landing still
+# running when the wait bound expires, leaves the AI branch on the older top until the next push or PR event.
+# Nothing ever overwrites a newer AI branch silently.
+# The run name tells other runs which kind this is (the API exposes no concurrency group); it cannot
+# read env, so it carries the event's own refs and the resolver compares them with HUMAN_BRANCH.
+run-name: "alpha-follow ${{ github.event_name }} ${{ github.event_name == 'pull_request' && format('#{0} {1} merged={2} base={3}', github.event.pull_request.number, github.event.pull_request.head.ref, github.event.pull_request.merged, github.event.pull_request.base.ref) || github.ref_name }}"
+env:
+  AI_BRANCH: alpha                   # AI-reviewed branch
+  HUMAN_BRANCH: main                 # human-reviewed branch
+  LAYER_PREFIXES: feat/,fix/,docs/      # the only place to edit when the naming rule gains a prefix
+on:
+  workflow_dispatch:          # manual trigger = dry run, moves nothing
+  push:
+    branches: ['**', '!alpha']   # Rendered AI exclusion: trigger filters cannot read env; Python filters layers.
+  pull_request:
+    types: [opened, reopened, closed, edited]
+# Landing runs get their own group so the resolver runs they trigger (each layer push fires one)
+# can never cancel or replace them; both groups keep cancel-in-progress off. The concurrency
+# expression cannot read env either, so the human branch is a literal here; workflow-drift.sh --render
+# substitutes it together with env.HUMAN_BRANCH (the two 'main' literals on the group line).
+# Landing and resolver runs may overlap: every push they make carries a lease taken before the PR
+# graph was read, so the loser of a race fails loudly and the next event re-resolves the AI branch.
+concurrency:
+  group: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main')) && 'alpha-follow-landing' || 'alpha-follow' }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  follow:
+    # Fork and Dependabot PR events carry no secrets and are never layers.
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        id: checkout
+        with:
+          ref: ${{ env.HUMAN_BRANCH }}                                  # landing rebases the complete stack
+          fetch-depth: 0
+          token: ${{ secrets.ALPHA_FOLLOW_TOKEN }}   # GITHUB_TOKEN is read-only where the organization policy says so
+      - name: Land into the human branch (retarget children, delete landed heads, rebase and lease-push layers)
+        id: landing
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.ALPHA_FOLLOW_TOKEN }}
+          LANDED: ${{ github.event_name == 'pull_request' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == env.HUMAN_BRANCH && github.event.pull_request.head.ref || '' }}
+          LANDED_SHA: ${{ github.event.pull_request.head.sha }}
+          LANDED_NUMBER: ${{ github.event.pull_request.number }}
+          LANDED_MERGE: ${{ github.event.pull_request.merge_commit_sha }}   # after a rebase merge: the commit the human branch was advanced to
+        run: |
+          git config user.name "alpha-follow"
+          git config user.email "alpha-follow@users.noreply.github.com"
+          python3 - <<'PYLAND'
+          import json, os, subprocess, sys, time
+          human = os.environ['HUMAN_BRANCH']
+          ai = os.environ['AI_BRANCH']
+          def run(*args, **kwargs):
+              return subprocess.run(args, check=True, text=True, **kwargs)
+          def output(*args):
+              return run(*args, stdout=subprocess.PIPE).stdout.strip()
+          def fail(message):
+              sys.exit('landing: ' + message)
+          landed = os.environ['LANDED']   # head of the PR just merged into the human branch, else ''
+          human_pushed = os.environ['GITHUB_EVENT_NAME'] == 'push' and os.environ['GITHUB_REF'] == f'refs/heads/{human}'
+          if not landed and not human_pushed:
+              print(f'landing: {human} did not move; layers untouched; resolve {ai} only')
+              sys.exit(0)
+          prefixes = tuple(x.strip() for x in os.environ['LAYER_PREFIXES'].split(',') if x.strip())
+          def pr_list(state, fields):
+              return json.loads(output('gh', 'pr', 'list', '--state', state, '--limit', '1000', '--json', fields))
+          run('git', 'fetch', 'origin', '+refs/heads/*:refs/remotes/origin/*', '--prune')
+          open_prs = pr_list('open', 'number,headRefName,baseRefName,isCrossRepository')
+          open_heads = {p['headRefName'] for p in open_prs if not p.get('isCrossRepository')}
+          prs = [p for p in open_prs
+                 if not p.get('isCrossRepository') and p['headRefName'].startswith(prefixes)
+                 and p['baseRefName'] != ai]
+          merged_prs = pr_list('merged', 'headRefName,headRefOid,mergeCommit,isCrossRepository')
+          if landed:   # the merged list may lag the event; the event's PR passes the same guards below
+              # merge_commit_sha can be null on the closed event: fall back to the PR itself, then to the
+              # merged list re-read up to 3 times, and fail closed instead of dropping the entry silently
+              # (the push-to-human-branch run repeats this cascade, so a failure here is recovered).
+              merge, path = os.environ['LANDED_MERGE'], 'event merge_commit_sha'
+              if not merge:
+                  view = json.loads(output('gh', 'pr', 'view', os.environ['LANDED_NUMBER'], '--json', 'mergeCommit'))
+                  merge, path = (view.get('mergeCommit') or {}).get('oid') or '', 'gh pr view mergeCommit'
+              attempt = 0
+              while not merge and attempt < 3:
+                  attempt += 1
+                  if attempt > 1:
+                      time.sleep(int(os.environ.get('LANDED_RETRY_SECONDS', '5')))
+                      merged_prs = pr_list('merged', 'headRefName,headRefOid,mergeCommit,isCrossRepository')
+                  merge = next(((p.get('mergeCommit') or {}).get('oid') or '' for p in merged_prs
+                                if p['headRefName'] == landed and p['headRefOid'] == os.environ['LANDED_SHA']), '')
+                  path = f'merged list (read {attempt})'
+              if not merge:
+                  fail(f"merge commit of landed PR #{os.environ['LANDED_NUMBER']} ({landed}) unknown from the event, gh pr view and 3 merged-list reads; the {human} push run repeats this cascade")
+              print(f'landing: merge commit of {landed} is {merge} (from {path})', flush=True)
+              merged_prs.insert(0, {'headRefName': landed, 'headRefOid': os.environ['LANDED_SHA'],
+                                    'mergeCommit': {'oid': merge}})
+          branches = set(output('git', 'for-each-ref', '--format=%(refname:strip=3)',
+                                'refs/remotes/origin/').splitlines())
+          # A head is landed only when BOTH hold: its merged PR's merge commit is on the human branch, and the
+          # branch is gone or still at that PR's head. A fold (merged into another layer) sits at its
+          # PR head with its merge commit off the human branch; a reused branch name has a different tip: neither
+          # is landed, so neither retargets a child to the human branch nor gets deleted. An unknown merge commit
+          # (git exit 128) is not on the human branch either. The event's own head is included whatever its prefix
+          # (a landed dependabot/* branch is deleted by its own merged-PR event, under the same guards);
+          # retarget and rebase still apply to layers only, and other non-layer branches are
+          # scripts/branches.sh prune's business.
+          landed_tips = {}
+          for p in merged_prs:
+              head = p['headRefName']
+              oid = (p.get('mergeCommit') or {}).get('oid')
+              if p.get('isCrossRepository') or not (head.startswith(prefixes) or head == landed) or not oid or head in open_heads:
+                  continue
+              if head in branches and output('git', 'rev-parse', f'origin/{head}') != p['headRefOid']:
+                  continue
+              if subprocess.run(['git', 'merge-base', '--is-ancestor', oid, f'origin/{human}']).returncode == 0:
+                  landed_tips.setdefault(head, p['headRefOid'])
+          for p in prs:
+              base = p['baseRefName']
+              if base != human and base in landed_tips:
+                  run('gh', 'api', '-X', 'PATCH',
+                      f"repos/{os.environ['GITHUB_REPOSITORY']}/pulls/{p['number']}",
+                      '-f', f'base={human}', stdout=subprocess.DEVNULL)
+                  print(f"landing: retarget #{p['number']} {p['headRefName']} to {human}", flush=True)
+                  p['baseRefName'] = human
+          # Several independent stacks may be rooted at the human branch; inside a stack every layer has
+          # one child at most. A layer whose base is neither the human branch nor an open layer (a fold's
+          # child not yet retargeted by hand, a deleted or foreign base) fails closed here.
+          children, layer_heads = {}, set()
+          for p in prs:
+              parent = p['baseRefName']
+              if p['headRefName'] in layer_heads:
+                  fail(f"duplicate layer: two open PRs from {p['headRefName']}")
+              layer_heads.add(p['headRefName'])
+              if parent != human and parent in children:
+                  fail(f"chain is not a single line: multiple children of {parent}")
+              children.setdefault(parent, []).append(p['headRefName'])
+          chains, seen = [], set()
+          for root in sorted(children.get(human, [])):
+              chain, parent = [], root
+              while parent:
+                  if parent in seen:
+                      fail(f"cycle at {parent}")
+                  seen.add(parent)
+                  chain.append(parent)
+                  parent = (children.get(parent) or [None])[0]
+              chains.append(chain)
+          if len(seen) != len(prs):
+              stranded = sorted({p['headRefName'] for p in prs} - seen)
+              fail(f"open layers not reachable from {human}: {', '.join(stranded)}; every chain must start at {human}; retarget them by hand")
+          # After retargeting no open PR references these landed heads; their content is on the human branch.
+          # Delete before rebasing so a conflict leaves no stale landed branch to clean up.
+          for head, expected in landed_tips.items():
+              if head in (ai, human) or head in open_heads:
+                  fail(f"refusing to delete protected or reused open branch {head}")
+              if head not in branches:
+                  continue
+              if output('git', 'rev-parse', f'origin/{head}') != expected:
+                  fail(f"refusing to delete changed landed branch {head}")
+              result = subprocess.run(['git', 'push', f'--force-with-lease=refs/heads/{head}:{expected}',
+                                       'origin', '--delete', head],
+                                      text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              print(result.stdout, end='', flush=True)
+              if result.returncode and 'remote ref does not exist' not in result.stdout:
+                  fail(f"could not delete {head}; use scripts/branches.sh prune --execute after resolving the error")
+          # Chains are independent: each is pushed as soon as all of its rebases succeed, so a
+          # conflict in one chain leaves the earlier chains pushed and names the rest. The step
+          # then fails; the resolver and the AI branch steps still run (if: !cancelled()) so the AI branch is
+          # resolved from whatever was pushed, and the red run is the conflict signal.
+          for index, chain in enumerate(chains):
+              before = {}
+              parent, ref = human, f'origin/{human}'
+              for layer in chain:
+                  before[layer] = output('git', 'rev-parse', f'origin/{layer}')
+                  run('git', 'checkout', '-B', layer, f'origin/{layer}')
+                  result = subprocess.run(['git', 'rebase', ref], text=True)
+                  if result.returncode:
+                      files = output('git', 'diff', '--name-only', '--diff-filter=U')
+                      subprocess.run(['git', 'rebase', '--abort'], check=False)
+                      pending = ', '.join(' -> '.join(c) for c in chains[index:])
+                      fail(f"conflict rebasing {layer} onto {parent}; files: {files}; chains not pushed: {pending}; recover each pending chain bottom-up from {human}; earlier chains were pushed")
+                  parent, ref = layer, layer
+              # Finish all rebases WITHIN this chain before its first leased push.
+              for layer in chain:
+                  if output('git', 'rev-parse', layer) == before[layer]:
+                      print(f"landing: {layer} unchanged; skip push", flush=True)
+                      continue
+                  result = subprocess.run(['git', 'push', f'--force-with-lease={layer}:{before[layer]}', 'origin', layer])
+                  if result.returncode:
+                      pending = ', '.join(' -> '.join(c) for c in chains[index:])
+                      fail(f"push failed for {layer}; chains not fully pushed: {pending}; current chain may be partially pushed; fetch and reconcile before retrying")
+          print(f"landing: reconciled {len(chains)} chain(s); landed heads deleted or already absent: {', '.join(sorted(landed_tips)) or 'none'}", flush=True)
+          PYLAND
+      - name: Resolve the top of the chains rooted at the human branch
+        id: top
+        # Runs after a failed landing too: the AI branch must reflect what was pushed, not freeze.
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.ALPHA_FOLLOW_TOKEN }}
+          LANDING_RUN: ${{ (github.event_name == 'push' && github.ref == format('refs/heads/{0}', env.HUMAN_BRANCH)) || (github.event_name == 'pull_request' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == env.HUMAN_BRANCH) }}
+        run: |
+          # resolve.py stays on disk: the move step re-runs it once after a lost lease.
+          cat > resolve.py <<'PY'
+          import json, os, subprocess, sys, time
+          human = os.environ['HUMAN_BRANCH']
+          ai = os.environ['AI_BRANCH']
+          def fail(message):
+              sys.exit('resolver: ' + message)
+          def output(*args):
+              return subprocess.run(args, check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+          def landing_title(title):   # run names are set at the top of this file; the human branch is compared here, not there
+              return title == f'alpha-follow push {human}' or (title.startswith('alpha-follow pull_request ') and title.endswith(f' merged=true base={human}'))
+          # 1. Resolver runs wait for landing runs: the landing resolves the AI branch from the graph after its
+          #    cascade, so resolving beside it would race it. Bounded; after the bound the leased push
+          #    below still cannot overwrite a newer AI branch.
+          if os.environ.get('LANDING_RUN') != 'true' and os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch':
+              wait_seconds, poll = int(os.environ.get('LANDING_WAIT_SECONDS', '1200')), int(os.environ.get('LANDING_POLL_SECONDS', '20'))
+              deadline = time.monotonic() + wait_seconds
+              while True:
+                  active = set()   # one query per active status (the API filters by status; a newest-N page of every status could hide an old queued landing)
+                  for status in ('queued', 'in_progress', 'waiting', 'pending', 'requested'):
+                      runs = json.loads(output('gh', 'api', f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/workflows/alpha-follow.yml/runs?status={status}&per_page=100"))['workflow_runs']
+                      active.update(r['id'] for r in runs if str(r['id']) != os.environ.get('GITHUB_RUN_ID')
+                                    and r['status'] in ('queued', 'in_progress', 'pending', 'waiting', 'requested')
+                                    and landing_title(r.get('display_title') or ''))
+                  active = sorted(active)
+                  if not active:
+                      break
+                  if time.monotonic() >= deadline:
+                      print(f'landing run(s) {active} still active after {wait_seconds}s; resolving anyway under the lease', file=sys.stderr)
+                      break
+                  print(f'landing run(s) {active} active; waiting {poll}s (the landing resolves {ai} after its cascade)', file=sys.stderr, flush=True)
+                  time.sleep(poll)
+          # 2. The AI branch lease is taken BEFORE the PR graph is read: a run that resolved from an older
+          #    graph than a concurrent run's cannot overwrite the newer AI branch (its lease fails).
+          subprocess.run(['git', 'fetch', 'origin', f'+refs/heads/{ai}:refs/remotes/origin/{ai}'], check=True)
+          print('alpha_before=' + output('git', 'rev-parse', f'origin/{ai}'), flush=True)
+          # 3. The graph.
+          prs = json.loads(output('gh', 'pr', 'list', '--state', 'open', '--limit', '1000', '--json', 'headRefName,baseRefName,isCrossRepository'))
+          # Layers only: same-repo PRs whose head follows the naming rule (LAYER_PREFIXES, set once at
+          # the top of this file) and whose base is not the AI branch. Any other PR is not part of the stack.
+          LAYER = tuple(x.strip() for x in os.environ['LAYER_PREFIXES'].split(',') if x.strip())
+          prs = [p for p in prs if not p.get('isCrossRepository')
+                 and p['headRefName'].startswith(LAYER) and p['baseRefName'] != ai]
+          children, heads = {}, set()
+          for p in prs:
+              head, parent = p['headRefName'], p['baseRefName']
+              if head in heads:
+                  fail(f'duplicate layer {head}')
+              heads.add(head)
+              if parent != human and parent in children:
+                  fail(f'fork inside chain at {parent}')
+              children.setdefault(parent, []).append(head)
+          roots = sorted(children.get(human, []))
+          chain = set()
+          for root in roots:
+              current = root
+              while current:
+                  if current in chain:
+                      fail(f'cycle at {current}')
+                  chain.add(current)
+                  current = (children.get(current) or [None])[0]
+          if chain != heads:
+              fail('unreachable or cyclic layers; retarget pending: ' + ', '.join(sorted(heads - chain)))
+          # Fetch the human branch and the root heads before testing containment: PR bases alone are
+          # insufficient. A root whose head IS the human branch tip (an emptied layer) is contained by
+          # every sibling trivially and is skipped, not treated as a retarget in progress.
+          if len(roots) > 1:
+              subprocess.run(['git', 'fetch', '--no-tags', 'origin',
+                              *[f'+refs/heads/{r}:refs/remotes/origin/{r}' for r in [human, *roots]]], check=True)
+              human_tip = output('git', 'rev-parse', f'origin/{human}')
+              full = []
+              for root in roots:
+                  if output('git', 'rev-parse', f'origin/{root}') == human_tip:
+                      print(f'{root} is empty (head is the {human} tip); skipped in containment', file=sys.stderr)
+                  else:
+                      full.append(root)
+              for i, left in enumerate(full):
+                  for right in full[i + 1:]:
+                      for a, b in ((left, right), (right, left)):
+                          result = subprocess.run(['git', 'merge-base', '--is-ancestor', f'origin/{a}', f'origin/{b}'])
+                          if result.returncode == 0:
+                              fail(f'containing bottoms: {b} contains {a}; retarget/rebase pending; {ai} unchanged')
+                          if result.returncode != 1:
+                              fail(f'ancestry check failed for {a}, {b}; {ai} unchanged')
+          bases = {p['baseRefName'] for p in prs}
+          tops = sorted(h for h in chain if h not in bases)
+          if len(tops) > 1:
+              # Several independent stacks: there is no single top for the AI branch to follow, so it
+              # follows the human branch rather than going stale or picking a stack.
+              print(f"{len(tops)} independent stacks are open ({', '.join(tops)}); {ai} follows {human}", file=sys.stderr)
+              tops = []
+          print('top=' + (tops[0] if tops else human))   # no single open stack: the AI branch follows the human branch
+          PY
+          python3 resolve.py >> "$GITHUB_OUTPUT"
+      - name: Move the AI branch to the top (force-with-lease; it has no history of its own)
+        if: ${{ !cancelled() && steps.top.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.ALPHA_FOLLOW_TOKEN }}
+          LANDING_RUN: ${{ (github.event_name == 'push' && github.ref == format('refs/heads/{0}', env.HUMAN_BRANCH)) || (github.event_name == 'pull_request' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == env.HUMAN_BRANCH) }}
+          TOP: ${{ steps.top.outputs.top }}
+          CURRENT: ${{ steps.top.outputs.alpha_before }}   # The AI branch as it was before the PR graph was read
+        run: |
+          # Returns 0 moved or nothing to do, 1 lease lost, 2 fetch/rev-parse failed (the AI branch untouched; never a
+          # push from stale refs). Called under `||`, where errexit is off, so every command is checked here.
+          move() {   # The AI branch and the target are fetched together right before the leased push
+            git fetch origin "+refs/heads/$AI_BRANCH:refs/remotes/origin/$AI_BRANCH" "+refs/heads/$TOP:refs/remotes/origin/$TOP" || { echo "fetch of $AI_BRANCH and $TOP failed; $AI_BRANCH untouched"; return 2; }
+            TARGET=$(git rev-parse "origin/$TOP") || return 2
+            ALPHA=$(git rev-parse "origin/$AI_BRANCH") || return 2
+            [ -n "$TARGET" ] && [ -n "$ALPHA" ] || return 2
+            if [ "$ALPHA" = "$TARGET" ]; then echo "$AI_BRANCH already at $TOP ($TARGET)"; return 0; fi
+            if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then echo "DRY RUN: would move $AI_BRANCH $ALPHA -> $TARGET ($TOP)"; return 0; fi
+            if [ "$ALPHA" != "$CURRENT" ]; then echo "$AI_BRANCH moved $CURRENT -> $ALPHA since the graph was read"; return 1; fi
+            git push --force-with-lease="$AI_BRANCH":"$CURRENT" origin "$TARGET:refs/heads/$AI_BRANCH" || return 1
+            echo "$AI_BRANCH -> $TOP ($TARGET)"
+          }
+          rc=0; move || rc=$?
+          [ "$rc" -eq 1 ] || exit "$rc"
+          # A lost lease means a concurrent run moved the AI branch from another graph. Resolve ONCE more from a
+          # fresh graph with a fresh lease; a second loss fails this run and the next event resolves again.
+          echo "$AI_BRANCH lease lost; re-resolving once from a fresh graph"
+          python3 resolve.py > resolved.txt
+          TOP=$(sed -n 's/^top=//p' resolved.txt); CURRENT=$(sed -n 's/^alpha_before=//p' resolved.txt)
+          if [ -z "$TOP" ] || [ -z "$CURRENT" ]; then echo "re-resolve produced no target"; exit 1; fi
+          move
